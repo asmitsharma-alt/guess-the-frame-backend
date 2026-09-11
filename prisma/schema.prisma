@@ -1,0 +1,113 @@
+// Prisma Schema for Guess The Frame
+// Default datasource is SQLite for zero-friction local development and automated testing.
+// In production (e.g. Render PostgreSQL), set DATABASE_URL=postgresql://... and provider = "postgresql".
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String         @id @default(cuid())
+  username     String         @unique
+  email        String         @unique
+  passwordHash String
+  avatar       String         @default("aman")
+  role         String         @default("player") // "player", "admin", "host"
+  totalGames   Int            @default(0)
+  totalWins    Int            @default(0)
+  totalPoints  Int            @default(0)
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
+  rooms        Room[]
+  refreshTokens RefreshToken[]
+
+  @@map("users")
+}
+
+model RefreshToken {
+  id        String   @id @default(cuid())
+  token     String   @unique
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@map("refresh_tokens")
+}
+
+model Room {
+  id           String        @id @default(cuid())
+  code         String        @unique // 4-letter room code (e.g. FILM)
+  hostId       String?
+  host         User?         @relation(fields: [hostId], references: [id], onDelete: SetNull)
+  status       String        @default("WAITING") // "WAITING", "PLAYING", "FINISHED"
+  settings     String        @default("{}") // JSON string of settings (rounds, timer, category)
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+  sessions     GameSession[]
+
+  @@map("rooms")
+}
+
+model GameSession {
+  id           String        @id @default(cuid())
+  roomId       String
+  room         Room          @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  currentRound Int           @default(0)
+  totalRounds  Int           @default(10)
+  status       String        @default("IN_PROGRESS") // "IN_PROGRESS", "COMPLETED"
+  playlist     String        // JSON array of catalog items for this match
+  startedAt    DateTime      @default(now())
+  endedAt      DateTime?
+  guesses      GuessRecord[]
+  matchResult  MatchResult?
+
+  @@map("game_sessions")
+}
+
+model GuessRecord {
+  id             String      @id @default(cuid())
+  sessionId      String
+  session        GameSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  roundIndex     Int
+  playerId       String
+  playerName     String
+  guessText      String
+  isCorrect      Boolean     @default(false)
+  pointsAwarded  Int         @default(0)
+  responseTimeMs Int?
+  createdAt      DateTime    @default(now())
+
+  @@map("guess_records")
+}
+
+model MatchResult {
+  id          String      @id @default(cuid())
+  sessionId   String      @unique
+  session     GameSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  winnerName  String
+  winnerScore Int
+  scoreboard  String      // JSON array of player ranks and scores
+  createdAt   DateTime    @default(now())
+
+  @@map("match_results")
+}
+
+model CatalogItem {
+  id        String   @id @default(cuid())
+  category  String   // "frames", "eyes", "dialogue", "tie_breaker"
+  type      String   @default("image") // "image", "dialogue"
+  content   String   // File path or dialogue quote text
+  answer    String   // Canonical uppercase answer
+  year      String?  // Release year or context
+  hint      String?  // Optional hint string
+  aliases   String?  // JSON array of alternative acceptable answers
+  createdAt DateTime @default(now())
+
+  @@map("catalog_items")
+}
