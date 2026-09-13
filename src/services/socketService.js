@@ -228,7 +228,7 @@ class SocketService {
 
     client.playerId = String(msg.playerId || `p_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`).substring(0, 50);
     client.playerName = String(msg.playerName || 'Host').substring(0, 30).trim() || 'Host';
-    client.playerAvatar = String(msg.playerAvatar || 'aman').substring(0, 30);
+    client.playerAvatar = String(msg.playerAvatar || 'aman').substring(0, 500);
     client.roomCode = room.code;
     client.isHost = true;
 
@@ -288,7 +288,7 @@ class SocketService {
     const candidateId = String(msg.id || msg.playerId || client.playerId || `p_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`).substring(0, 50);
     client.playerId = candidateId;
     client.playerName = String(msg.name || msg.playerName || 'Player').substring(0, 30).trim() || 'Player';
-    client.playerAvatar = String(msg.avatar || msg.playerAvatar || 'aman').substring(0, 30);
+    client.playerAvatar = String(msg.avatar || msg.playerAvatar || 'aman').substring(0, 500);
     client.roomCode = roomCode;
     client.isHost = (room.hostId === client.playerId) || (room.players.size === 0);
 
