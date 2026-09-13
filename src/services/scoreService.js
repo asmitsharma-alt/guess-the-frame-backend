@@ -12,44 +12,70 @@ class ScoreService {
 
     try {
       if (prisma && prisma.matchResult) {
-        // Record match in DB
-        const session = await prisma.gameSession.create({
-          data: {
-            roomId: roomId || 'offline',
-            totalRounds: totalRounds || 10,
-            status: 'COMPLETED',
-            playlist: '[]',
-            endedAt: new Date(),
-            matchResult: {
-              create: {
-                winnerName: winner.name || 'Anonymous',
-                winnerScore: winner.score || 0,
-                scoreboard: JSON.stringify(sorted)
-              }
+        // Find existing room in DB by code or id
+        let dbRoomId = null;
+        if (roomId && roomId !== 'offline') {
+          const dbRoom = await prisma.room.findFirst({
+            where: {
+              OR: [
+                { id: roomId },
+                { code: roomId.toUpperCase() }
+              ]
             }
-          },
-          include: { matchResult: true }
-        });
-
-        // Update registered users stats if mapped
-        for (const player of scoreboard) {
-          if (player.userId) {
-            const isWinner = player.id === winner.id;
-            await prisma.user.update({
-              where: { id: player.userId },
+          });
+          if (dbRoom) {
+            dbRoomId = dbRoom.id;
+          } else {
+            // Create minimal room record if not present
+            const created = await prisma.room.create({
               data: {
-                totalGames: { increment: 1 },
-                totalWins: { increment: isWinner ? 1 : 0 },
-                totalPoints: { increment: player.score || 0 }
+                code: roomId.toUpperCase().substring(0, 8),
+                status: 'FINISHED'
               }
-            }).catch(() => {});
+            });
+            dbRoomId = created.id;
           }
         }
 
-        return session.matchResult;
+        if (dbRoomId) {
+          const session = await prisma.gameSession.create({
+            data: {
+              roomId: dbRoomId,
+              totalRounds: totalRounds || 10,
+              status: 'COMPLETED',
+              playlist: '[]',
+              endedAt: new Date(),
+              matchResult: {
+                create: {
+                  winnerName: winner.name || 'Anonymous',
+                  winnerScore: winner.score || 0,
+                  scoreboard: JSON.stringify(sorted)
+                }
+              }
+            },
+            include: { matchResult: true }
+          });
+
+          // Update registered users stats if mapped
+          for (const player of scoreboard) {
+            if (player.userId) {
+              const isWinner = player.id === winner.id;
+              await prisma.user.update({
+                where: { id: player.userId },
+                data: {
+                  totalGames: { increment: 1 },
+                  totalWins: { increment: isWinner ? 1 : 0 },
+                  totalPoints: { increment: player.score || 0 }
+                }
+              }).catch(() => {});
+            }
+          }
+
+          return session.matchResult;
+        }
       }
     } catch (err) {
-      logger.warn('Failed to record match result to DB:', err.message);
+      logger.warn('Failed to record match result to DB: %s', err.message);
     }
 
     return {

@@ -7,7 +7,7 @@ generator client {
 }
 
 datasource db {
-  provider = "sqlite"
+  provider = "postgresql"
   url      = env("DATABASE_URL")
 }
 
@@ -52,6 +52,8 @@ model Room {
   sessions     GameSession[]
 
   @@map("rooms")
+  @@index([status])
+  @@index([hostId])
 }
 
 model GameSession {
@@ -68,6 +70,8 @@ model GameSession {
   matchResult  MatchResult?
 
   @@map("game_sessions")
+  @@index([roomId])
+  @@index([status])
 }
 
 model GuessRecord {
@@ -84,6 +88,8 @@ model GuessRecord {
   createdAt      DateTime    @default(now())
 
   @@map("guess_records")
+  @@index([sessionId])
+  @@index([playerId])
 }
 
 model MatchResult {
@@ -110,4 +116,5 @@ model CatalogItem {
   createdAt DateTime @default(now())
 
   @@map("catalog_items")
+  @@index([category])
 }

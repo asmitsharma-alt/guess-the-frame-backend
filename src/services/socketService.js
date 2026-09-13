@@ -9,50 +9,91 @@ class SocketService {
   constructor() {
     this.wss = null;
     this.connections = new Map(); // socket -> clientData
+    this.connectionsByIp = new Map(); // ip -> count
+    this.pendingDisconnects = new Map(); // `${roomCode}_${playerId}` -> timer
+    this.pingInterval = null;
+    this.MAX_CONNECTIONS_PER_IP = 25;
+    this.MAX_MESSAGE_SIZE = 65536; // 64KB
   }
 
   init(server) {
-    this.wss = new WebSocketServer({ server, path: '/ws' });
+    this.wss = new WebSocketServer({
+      server,
+      path: '/ws',
+      maxPayload: this.MAX_MESSAGE_SIZE
+    });
 
     this.wss.on('connection', (ws, req) => {
-      const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
-      logger.info('WebSocket client connected from %s', clientIp);
+      const clientIp = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown')
+        .split(',')[0]
+        .trim();
+
+      // Enforce per-IP connection limit to prevent socket exhaustion DoS
+      const currentIpCount = this.connectionsByIp.get(clientIp) || 0;
+      if (currentIpCount >= this.MAX_CONNECTIONS_PER_IP) {
+        logger.warn('WebSocket connection rejected: IP %s exceeded max connections limit (%d)', clientIp, this.MAX_CONNECTIONS_PER_IP);
+        ws.close(1008, 'Connection limit exceeded for this IP');
+        return;
+      }
+
+      this.connectionsByIp.set(clientIp, currentIpCount + 1);
+      logger.info('WebSocket client connected from %s (active from IP: %d)', clientIp, currentIpCount + 1);
 
       const clientData = {
         ws,
+        ip: clientIp,
         playerId: null,
         playerName: null,
         playerAvatar: 'aman',
         roomCode: null,
         isHost: false,
+        isAlive: true,
         lastHeartbeat: Date.now()
       };
 
       this.connections.set(ws, clientData);
 
+      // Handle standard WS ping/pong
+      ws.on('pong', () => {
+        clientData.isAlive = true;
+        clientData.lastHeartbeat = Date.now();
+      });
+
       ws.on('message', (data) => {
+        if (data.length > this.MAX_MESSAGE_SIZE) {
+          logger.warn('Dropping oversized WebSocket message from %s (%d bytes)', clientIp, data.length);
+          return;
+        }
+
         try {
           const message = JSON.parse(data.toString());
+          clientData.lastHeartbeat = Date.now();
           this.handleMessage(ws, message);
         } catch (err) {
-          logger.warn('Failed to parse WebSocket message: %s', err.message);
+          logger.warn('Failed to parse WebSocket message from %s: %s', clientIp, err.message);
         }
       });
 
       ws.on('close', () => {
+        const remaining = (this.connectionsByIp.get(clientIp) || 1) - 1;
+        if (remaining <= 0) {
+          this.connectionsByIp.delete(clientIp);
+        } else {
+          this.connectionsByIp.set(clientIp, remaining);
+        }
         this.handleDisconnect(ws);
       });
 
       ws.on('error', (err) => {
-        logger.warn('WebSocket error on client connection: %s', err.message);
+        logger.warn('WebSocket error on client connection (%s): %s', clientIp, err.message);
       });
 
       // Send initial connection acknowledgement
       this.send(ws, { type: 'CONNECTION_ACK', timestamp: Date.now() });
     });
 
-    // Run connection watchdog interval
-    setInterval(() => this.cleanupStaleConnections(), 30000);
+    // Run connection watchdog ping interval every 30s
+    this.pingInterval = setInterval(() => this.runHeartbeatWatchdog(), 30000);
     logger.info('WebSocket Realtime Server initialized on /ws');
   }
 
@@ -65,12 +106,15 @@ class SocketService {
   broadcastToRoom(roomCode, message, excludeWs = null) {
     if (!roomCode) return;
     const cleanCode = String(roomCode).toUpperCase().trim();
+    let count = 0;
 
     for (const [socket, client] of this.connections.entries()) {
       if (client.roomCode === cleanCode && socket !== excludeWs) {
         this.send(socket, message);
+        count++;
       }
     }
+    logger.info('[WS BROADCAST] roomCode=%s type=%s sentTo=%d sockets', cleanCode, message.type, count);
   }
 
   handleMessage(ws, msg) {
@@ -79,6 +123,7 @@ class SocketService {
 
     const type = msg.type;
     const roomCode = String(msg.roomCode || client.roomCode || '').toUpperCase().trim();
+    logger.info('[WS INCOMING] type=%s roomCode=%s playerId=%s', type, roomCode, msg.playerId || msg.id || client.playerId);
 
     switch (type) {
       case 'CREATE_ROOM':
@@ -89,11 +134,18 @@ class SocketService {
         this.handlePlayerJoin(ws, client, msg);
         break;
 
+      case 'HOST_HEARTBEAT':
+        if (!client.roomCode || !client.isHost) return;
+        this.broadcastToRoom(roomCode, msg, ws);
+        break;
+
       case 'CLIENT_HEARTBEAT':
+        if (!client.roomCode) return;
         client.lastHeartbeat = Date.now();
         break;
 
       case 'START_MATCH':
+      case 'MATCH_START':
         this.handleStartMatch(ws, client, msg);
         break;
 
@@ -133,6 +185,12 @@ class SocketService {
         this.handlePlayerLeave(ws, client);
         break;
 
+      case 'GUIDE_COMPLETE':
+        if (roomCode) {
+          this.broadcastToRoom(roomCode, msg, ws);
+        }
+        break;
+
       default:
         // Relay any custom events for backward compatibility
         if (roomCode) {
@@ -143,11 +201,34 @@ class SocketService {
 
   async handleCreateRoom(ws, client, msg) {
     const settings = msg.settings || {};
-    const room = await roomService.createRoom({ settings });
+    let room;
+    if (msg.roomCode) {
+      const code = String(msg.roomCode).toUpperCase().trim();
+      room = roomService.getRoom(code);
+      if (!room) {
+        room = {
+          code,
+          hostId: null,
+          status: 'WAITING',
+          settings: { category: 'frames', categories: ['frames'], rounds: 10, timer: 30, ...settings },
+          players: new Map(),
+          playlist: [],
+          currentPlayIndex: 0,
+          roundWinners: [],
+          isMatchActive: false,
+          isPaused: false,
+          currentRoundStartedAt: 0,
+          lastActivity: Date.now()
+        };
+        roomService.activeRooms.set(code, room);
+      }
+    } else {
+      room = await roomService.createRoom({ settings });
+    }
 
-    client.playerId = msg.playerId || `p_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`;
-    client.playerName = msg.playerName || 'Host';
-    client.playerAvatar = msg.playerAvatar || 'aman';
+    client.playerId = String(msg.playerId || `p_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`).substring(0, 50);
+    client.playerName = String(msg.playerName || 'Host').substring(0, 30).trim() || 'Host';
+    client.playerAvatar = String(msg.playerAvatar || 'aman').substring(0, 30);
     client.roomCode = room.code;
     client.isHost = true;
 
@@ -158,7 +239,8 @@ class SocketService {
       avatar: client.playerAvatar,
       score: 0,
       isHost: true,
-      loaded: true
+      loaded: true,
+      connected: true
     });
 
     this.send(ws, {
@@ -168,24 +250,54 @@ class SocketService {
       players: Array.from(room.players.values()),
       settings: room.settings
     });
+    logger.info('[WS ROOM_CREATED] roomCode=%s hostId=%s totalPlayers=%d', room.code, client.playerId, room.players.size);
   }
 
   handlePlayerJoin(ws, client, msg) {
     const roomCode = String(msg.roomCode || '').toUpperCase().trim();
-    const room = roomService.getRoom(roomCode);
+    let room = roomService.getRoom(roomCode);
 
     if (!room) {
-      return this.send(ws, {
-        type: 'JOIN_ERROR',
-        error: `Room "${roomCode}" not found. Check the code and try again.`
-      });
+      // If the connecting player is host, automatically create room state
+      if (msg.isHost) {
+        room = {
+          code: roomCode,
+          hostId: null,
+          status: 'WAITING',
+          settings: { category: 'frames', categories: ['frames'], rounds: 10, timer: 30 },
+          players: new Map(),
+          playlist: [],
+          currentPlayIndex: 0,
+          roundWinners: [],
+          isMatchActive: false,
+          isPaused: false,
+          currentRoundStartedAt: 0,
+          lastActivity: Date.now()
+        };
+        roomService.activeRooms.set(roomCode, room);
+        logger.info('[WS AUTO CREATE ROOM] roomCode=%s for host', roomCode);
+      } else {
+        logger.warn('[WS JOIN_ERROR] Room %s NOT FOUND for playerId=%s (activeRooms=%s)', roomCode, msg.playerId || msg.id, Array.from(roomService.activeRooms.keys()).join(','));
+        return this.send(ws, {
+          type: 'JOIN_ERROR',
+          error: `Room "${roomCode}" not found. Check the code and try again.`
+        });
+      }
     }
 
-    client.playerId = msg.id || msg.playerId || client.playerId || `p_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`;
-    client.playerName = msg.name || msg.playerName || 'Player';
-    client.playerAvatar = msg.avatar || msg.playerAvatar || 'aman';
+    const candidateId = String(msg.id || msg.playerId || client.playerId || `p_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`).substring(0, 50);
+    client.playerId = candidateId;
+    client.playerName = String(msg.name || msg.playerName || 'Player').substring(0, 30).trim() || 'Player';
+    client.playerAvatar = String(msg.avatar || msg.playerAvatar || 'aman').substring(0, 30);
     client.roomCode = roomCode;
     client.isHost = (room.hostId === client.playerId) || (room.players.size === 0);
+
+    // Cancel pending disconnect timer if player reconnected within grace period
+    const disconnectKey = `${roomCode}_${client.playerId}`;
+    if (this.pendingDisconnects.has(disconnectKey)) {
+      clearTimeout(this.pendingDisconnects.get(disconnectKey));
+      this.pendingDisconnects.delete(disconnectKey);
+    }
 
     const existingPlayer = room.players.get(client.playerId);
     const playerData = {
@@ -194,7 +306,8 @@ class SocketService {
       avatar: client.playerAvatar,
       score: existingPlayer ? existingPlayer.score : 0,
       isHost: client.isHost,
-      loaded: true
+      loaded: true,
+      connected: true
     };
 
     room.players.set(client.playerId, playerData);
@@ -214,6 +327,8 @@ class SocketService {
     // Broadcast updated player list to room
     this.broadcastToRoom(roomCode, {
       type: 'PLAYER_JOIN',
+      roomCode,
+      senderId: client.playerId,
       id: client.playerId,
       playerId: client.playerId,
       name: client.playerName,
@@ -227,9 +342,11 @@ class SocketService {
     const room = roomService.getRoom(client.roomCode);
     if (!room || (!client.isHost && room.hostId !== client.playerId)) return;
 
-    const playlist = await catalogService.generatePlaylist(room.settings);
+    const playlist = (msg.currentPlaylist && msg.currentPlaylist.length > 0)
+      ? msg.currentPlaylist
+      : await catalogService.generatePlaylist(room.settings);
     room.playlist = playlist;
-    room.currentPlayIndex = 0;
+    room.currentPlayIndex = msg.currentPlayIndex || 0;
     room.roundWinners = [];
     room.isMatchActive = true;
     room.status = 'PLAYING';
@@ -245,10 +362,18 @@ class SocketService {
       roomCode: room.code,
       playlist,
       totalRounds: playlist.length,
-      currentPlayIndex: 0,
-      currentFrame: playlist[0],
+      currentPlayIndex: room.currentPlayIndex,
+      currentFrame: playlist[room.currentPlayIndex],
       players: Array.from(room.players.values()),
       settings: room.settings
+    });
+
+    this.broadcastToRoom(room.code, {
+      type: 'MATCH_START',
+      roomCode: room.code,
+      currentPlaylist: playlist,
+      currentPlayIndex: room.currentPlayIndex,
+      players: Array.from(room.players.values())
     });
   }
 
@@ -313,6 +438,13 @@ class SocketService {
       // Broadcast winner banner & updated leaderboard
       this.broadcastToRoom(room.code, {
         type: 'ROUND_WINNER',
+        winner: winnerEntry,
+        roundWinners: room.roundWinners,
+        players: Array.from(room.players.values())
+      });
+
+      this.broadcastToRoom(room.code, {
+        type: 'GUESS_CORRECT_BROADCAST',
         winner: winnerEntry,
         roundWinners: room.roundWinners,
         players: Array.from(room.players.values())
@@ -528,10 +660,21 @@ class SocketService {
         }
       }
 
+      const wasHost = client.isHost || (room.hostId === client.playerId);
+
+      this.broadcastToRoom(room.code, {
+        type: 'PLAYER_LEAVE',
+        playerId: client.playerId,
+        senderId: client.playerId,
+        isHost: wasHost,
+        players: Array.from(room.players.values())
+      });
+
       this.broadcastToRoom(room.code, {
         type: 'PLAYER_LEFT',
         playerId: client.playerId,
         playerName: client.playerName,
+        isHost: wasHost,
         players: Array.from(room.players.values())
       });
 
@@ -546,22 +689,108 @@ class SocketService {
 
   handleDisconnect(ws) {
     const client = this.connections.get(ws);
-    if (client) {
-      this.handlePlayerLeave(ws, client);
-      this.connections.delete(ws);
+    if (!client) return;
+
+    const { roomCode, playerId } = client;
+    this.connections.delete(ws);
+
+    if (roomCode && playerId) {
+      const room = roomService.getRoom(roomCode);
+      if (room && room.players.has(playerId)) {
+        // Mark player disconnected temporarily
+        const player = room.players.get(playerId);
+        player.connected = false;
+
+        // Schedule grace period (7 seconds) before removing player
+        const disconnectKey = `${roomCode}_${playerId}`;
+        if (this.pendingDisconnects.has(disconnectKey)) {
+          clearTimeout(this.pendingDisconnects.get(disconnectKey));
+        }
+
+        const timer = setTimeout(() => {
+          this.pendingDisconnects.delete(disconnectKey);
+          // If player still disconnected, officially remove them
+          const currentRoom = roomService.getRoom(roomCode);
+          if (currentRoom && currentRoom.players.has(playerId)) {
+            const p = currentRoom.players.get(playerId);
+            if (!p.connected) {
+              this.handlePlayerLeave(ws, client);
+            }
+          }
+        }, 7000);
+
+        this.pendingDisconnects.set(disconnectKey, timer);
+
+        // Notify room that player disconnected temporarily
+        this.broadcastToRoom(roomCode, {
+          type: 'PLAYER_DISCONNECTED_TEMP',
+          playerId,
+          playerName: client.playerName
+        });
+        return;
+      }
     }
+
+    this.handlePlayerLeave(ws, client);
   }
 
-  cleanupStaleConnections() {
+  runHeartbeatWatchdog() {
     const now = Date.now();
     for (const [ws, client] of this.connections.entries()) {
-      if (now - client.lastHeartbeat > 90000) { // 90s inactive
+      if (!client.isAlive || (now - client.lastHeartbeat > 75000)) {
+        logger.info('Terminating inactive WebSocket client (%s, %s)', client.ip, client.playerId || 'anonymous');
         try {
           ws.terminate();
         } catch (e) {}
         this.connections.delete(ws);
+        continue;
+      }
+
+      client.isAlive = false;
+      try {
+        ws.ping();
+      } catch (e) {
+        ws.terminate();
+        this.connections.delete(ws);
       }
     }
+  }
+
+  cleanupStaleConnections() {
+    this.runHeartbeatWatchdog();
+  }
+
+  closeAll(reason = 'Server shutting down') {
+    if (this.pingInterval) {
+      clearInterval(this.pingInterval);
+      this.pingInterval = null;
+    }
+    for (const timer of this.pendingDisconnects.values()) {
+      clearTimeout(timer);
+    }
+    this.pendingDisconnects.clear();
+
+    for (const [ws] of this.connections.entries()) {
+      try {
+        ws.close(1001, reason);
+      } catch (e) {}
+    }
+    this.connections.clear();
+    this.connectionsByIp.clear();
+
+    if (this.wss) {
+      try {
+        this.wss.close();
+      } catch (e) {}
+    }
+  }
+
+  getStats() {
+    return {
+      activeConnections: this.connections.size,
+      activeRooms: roomService.activeRooms ? roomService.activeRooms.size : 0,
+      uniqueIps: this.connectionsByIp.size
+    };
   }
 }
 

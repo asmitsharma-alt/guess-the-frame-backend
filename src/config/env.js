@@ -21,4 +21,18 @@ const env = {
   logLevel: process.env.LOG_LEVEL || 'info'
 };
 
+// Security Assertion: Prevent running in production with default secrets
+if (env.isProduction) {
+  if (
+    !process.env.JWT_ACCESS_SECRET ||
+    env.jwt.accessSecret === 'gtf_default_access_secret_key_change_in_production' ||
+    !process.env.JWT_REFRESH_SECRET ||
+    env.jwt.refreshSecret === 'gtf_default_refresh_secret_key_change_in_production'
+  ) {
+    throw new Error(
+      'FATAL SECURITY RISK: Insecure default JWT secrets detected in production. You must set JWT_ACCESS_SECRET and JWT_REFRESH_SECRET environment variables.'
+    );
+  }
+}
+
 module.exports = env;

@@ -10,10 +10,15 @@ const sanitizeInputs = (req, res, next) => {
         .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '')
         .replace(/[<>]/g, (tag) => ({ '<': '&lt;', '>': '&gt;' }[tag] || tag));
     }
-    if (typeof val === 'object' && val !== null) {
+    if (Array.isArray(val)) {
+      return val.map(sanitize);
+    }
+    if (typeof val === 'object' && val !== null && !(val instanceof Date) && !(val instanceof RegExp)) {
+      const sanitized = {};
       for (const key of Object.keys(val)) {
-        val[key] = sanitize(val[key]);
+        sanitized[key] = sanitize(val[key]);
       }
+      return sanitized;
     }
     return val;
   };
@@ -34,10 +39,26 @@ const corsOptions = {
   origin: (origin, callback) => {
     // Allow requests with no origin (e.g. mobile apps, curl, tests)
     if (!origin) return callback(null, true);
+    
+    // Check configured origins or wildcard
     if (env.cors.origins.includes(origin) || env.cors.origins.includes('*') || !env.isProduction) {
       return callback(null, true);
     }
-    return callback(new Error('Blocked by CORS policy'));
+
+    // Support Vercel deployments and custom production domains
+    try {
+      const parsedUrl = new URL(origin);
+      if (
+        parsedUrl.hostname.endsWith('.vercel.app') ||
+        parsedUrl.hostname.endsWith('scoopcast-live.in') ||
+        parsedUrl.hostname.endsWith('asmit.tech')
+      ) {
+        return callback(null, true);
+      }
+    } catch (e) {}
+
+    // Clean CORS denial without throwing 500 error
+    return callback(null, false);
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],

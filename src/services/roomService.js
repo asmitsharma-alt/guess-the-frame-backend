@@ -7,6 +7,7 @@ const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 class RoomService {
   constructor() {
     this.activeRooms = new Map(); // roomCode -> RoomState
+    this.cleanupInterval = setInterval(() => this.sweepStaleRooms(), 15 * 60 * 1000); // Every 15m
   }
 
   generateRoomCode() {
@@ -21,9 +22,13 @@ class RoomService {
     let code = this.generateRoomCode();
     let attempts = 0;
 
-    while (this.activeRooms.has(code) && attempts < 10) {
+    while (this.activeRooms.has(code) && attempts < 100) {
       code = this.generateRoomCode();
       attempts++;
+    }
+
+    if (this.activeRooms.has(code)) {
+      throw new Error('Room capacity full. Please try again in a moment.');
     }
 
     const defaultSettings = {
@@ -58,7 +63,8 @@ class RoomService {
           where: { code },
           update: {
             settings: JSON.stringify(defaultSettings),
-            status: 'WAITING'
+            status: 'WAITING',
+            updatedAt: new Date()
           },
           create: {
             code,
@@ -78,7 +84,54 @@ class RoomService {
   getRoom(code) {
     if (!code) return null;
     const cleanCode = String(code).toUpperCase().trim();
-    return this.activeRooms.get(cleanCode) || null;
+    const room = this.activeRooms.get(cleanCode);
+    if (room) {
+      room.lastActivity = Date.now();
+      return room;
+    }
+    return null;
+  }
+
+  async getRoomAsync(code) {
+    if (!code) return null;
+    const cleanCode = String(code).toUpperCase().trim();
+    let room = this.getRoom(cleanCode);
+    if (room) return room;
+
+    // Database fallback / re-hydration
+    try {
+      if (prisma && prisma.room) {
+        const dbRoom = await prisma.room.findUnique({ where: { code: cleanCode } });
+        if (dbRoom && dbRoom.status !== 'FINISHED' && dbRoom.status !== 'EXPIRED') {
+          let parsedSettings = {};
+          try {
+            parsedSettings = JSON.parse(dbRoom.settings || '{}');
+          } catch (e) {}
+
+          room = {
+            code: cleanCode,
+            hostId: dbRoom.hostId,
+            status: dbRoom.status,
+            settings: parsedSettings,
+            players: new Map(),
+            playlist: [],
+            currentPlayIndex: 0,
+            roundWinners: [],
+            isMatchActive: dbRoom.status === 'PLAYING',
+            isPaused: false,
+            currentRoundStartedAt: 0,
+            lastActivity: Date.now()
+          };
+          this.activeRooms.set(cleanCode, room);
+          logger.info('Re-hydrated room %s from database', cleanCode);
+          return room;
+        }
+      }
+    } catch (err) {
+      logger.warn('Failed to rehydrate room from DB: %s', err.message);
+    }
+
+    return null;
   }
 
   hasRoom(code) {
@@ -104,9 +157,45 @@ class RoomService {
     return room;
   }
 
+  async updateRoomStatus(code, status) {
+    const room = this.getRoom(code);
+    if (room) {
+      room.status = status;
+      room.lastActivity = Date.now();
+    }
+    try {
+      if (prisma && prisma.room) {
+        await prisma.room.update({
+          where: { code },
+          data: { status, updatedAt: new Date() }
+        });
+      }
+    } catch (err) {
+      logger.warn('Failed to update room status in DB: %s', err.message);
+    }
+  }
+
   removeRoom(code) {
     const cleanCode = String(code).toUpperCase().trim();
     return this.activeRooms.delete(cleanCode);
+  }
+
+  sweepStaleRooms() {
+    const now = Date.now();
+    const TWO_HOURS = 2 * 60 * 60 * 1000;
+
+    for (const [code, room] of this.activeRooms.entries()) {
+      if (now - room.lastActivity > TWO_HOURS && room.players.size === 0) {
+        logger.info('Sweeping stale room %s (inactive for >2h)', code);
+        this.activeRooms.delete(code);
+        if (prisma && prisma.room) {
+          prisma.room.update({
+            where: { code },
+            data: { status: 'EXPIRED' }
+          }).catch(() => {});
+        }
+      }
+    }
   }
 }
 

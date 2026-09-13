@@ -44,11 +44,11 @@ const DEFAULT_DIALOGUES = [
   { type: "dialogue", content: "Yeh koi tareeka hai bheek maangne ka?!", answer: "GOLMAAL", year: "2006" },
   { type: "dialogue", content: "Meri ek taang nakli hai, main hockey ka bohot bada khiladi tha...", answer: "WELCOME", year: "2007" },
   { type: "dialogue", content: "Arey ₹5 mein chicken biryani de raha hai re woh!", answer: "RUN", year: "2004" },
-  { type: "dialogue", content: "We're looking for two oil boys who can grease us up before each competition.", answer: "DUMB AND DUMBER", year: "1994" },
+  { type: "dialogue", content: "Hi, guys. We're going on a national bikini tour, and we're looking for two oil boys who can grease us up before each competition.", answer: "DUMB AND DUMBER", year: "1994" },
   { type: "dialogue", content: "It’s not a purse, it’s a satchel. Gods and Indiana Jones wears one.", answer: "THE HANGOVER", year: "2009" },
   { type: "dialogue", content: "I'm not Bad. I'm just Drawn That Way.", answer: "WHO FRAMED ROGER RABBIT", year: "1988" },
   { type: "dialogue", content: "I don't want to survive. I want to live.", answer: "WALL-E", year: "2008" },
-  { type: "dialogue", content: "I wasted so much time worrying what could go wrong...", answer: "THE WORST PERSON IN THE WORLD", year: "2021" }
+  { type: "dialogue", content: "I wasted so much time worrying what could go wrong, but what did go wrong, was never the things I worried about.", answer: "THE WORST PERSON IN THE WORLD", year: "2021" }
 ];
 
 const DEFAULT_TIE_BREAKERS = [
